@@ -1,253 +1,346 @@
 #!/usr/bin/env python3
-
 """
 Enhanced File to Markdown Converter
 
 This script combines multiple files into a single Markdown document, treating each file
-as an "escaped attachment". It supports PDF, DOCX, plain text, and XLSX files, with
-recursive directory searching and filename pattern matching.
+as an "escaped attachment". It supports PDF, DOCX, PPTX (via python-pptx), plain text,
+and XLSX files, with recursive directory searching and filename pattern matching.
 
-Dependencies:
-- pdfminer.six: For extracting text from PDFs
-- pdf2image: For converting PDFs to images (used in OCR)
-- pytesseract: For OCR on PDF images
-- pypandoc: For converting DOCX to Markdown
-- pandas: For reading XLSX files as dataframes
-- openpyxl (engine): For parsing XLSX in pandas
-- (Optional) tabulate: If your pandas version doesn't include built-in to_markdown.
+Changes in this version
+-----------------------
+* **Hidden-file handling** – dotfiles are skipped by default.
+  Pass `--include-hidden-files` to override.
 
-Usage:
-python3 files2md [-r] [--name-regex REGEX] [--name-code] [--name-docs] file1.pdf dir1 file2.docx > output.md
+Dependencies
+------------
+- pdfminer.six     : PDF text extraction
+- pdf2image        : PDF → image conversion (for OCR fallback)
+- pytesseract      : OCR on PDF images
+- pypandoc         : DOCX → Markdown conversion
+- python-pptx      : PPTX text extraction
+- pandas + openpyxl: XLSX → Markdown tables
 """
 
 import argparse
+import os
 import re
 import sys
-import os
 
-from pdfminer.high_level import extract_text
 from pdf2image import convert_from_path
-import pytesseract
+from pdfminer.high_level import extract_text
+import pandas as pd
 import pypandoc
-import pandas as pd  # <-- New import for XLSX handling
+import pytesseract
 
-# Common file patterns
-CODE_FILE_PATTERN = r'\.(py|js|java|c|cpp|h|hpp|cs|rb|go|rs|php|html|css|sql|sh|bash|ps1|rkt|hs|scala|ml|elm|clj|ex|exs|erl|fs|fsx|lisp|scm|sml|swift|kt|kts|groovy|pl|pm|t|lua|jl|dart|d|nim|cr|r|R|asm|s|zig|v|ada|f90|f95|f03|f08|pas|cob|cobol|vb|vba|vbs|tcl|hx|m|mm|ts|coffee|ts|ls|cljc|cljs|raku|bf|md|txt)$|^(Makefile|Dockerfile|Rakefile|Gemfile|Vagrantfile|CMakeLists\.txt)$'
-DOCS_FILE_PATTERN = r'\.(md|txt|rst|tex|rtf|odt|doc|docx|pdf|epub|csv|tsv|json|xml|yaml|yml|ini|cfg|conf|log)$'
+# Optional PPTX support
+try:
+    from pptx import Presentation
+except ImportError:
+    Presentation = None  # handled gracefully at runtime
 
-def escape_backticks(text):
-    """
-    Escape backticks within text by increasing the surrounding backtick count.
-    
+# --------------------------------------------------------------------------- #
+#  Filename-matching presets
+# --------------------------------------------------------------------------- #
+
+CODE_FILE_PATTERN = (
+    r'\.(py|js|java|c|cpp|h|hpp|cs|rb|go|rs|php|html|css|sql|sh|bash|ps1|rkt|hs|'
+    r'scala|ml|elm|clj|ex|exs|erl|fs|fsx|lisp|scm|sml|swift|kt|kts|groovy|pl|pm|'
+    r't|lua|jl|dart|d|nim|cr|r|R|asm|s|zig|v|ada|f90|f95|f03|f08|pas|cob|cobol|'
+    r'vb|vba|vbs|tcl|hx|m|mm|ts|coffee|ls|cljc|cljs|raku|bf|md|txt)$'
+    r'|^(Makefile|Dockerfile|Rakefile|Gemfile|Vagrantfile|CMakeLists\.txt)$'
+)
+DOCS_FILE_PATTERN = (
+    r'\.(md|txt|rst|tex|rtf|odt|doc|docx|pdf|epub|csv|tsv|json|xml|yaml|yml|ini|'
+    r'cfg|conf|log|pptx)$'
+)
+
+# --------------------------------------------------------------------------- #
+#  Utility helpers
+# --------------------------------------------------------------------------- #
+
+
+def escape_backticks(text: str) -> str:
+    """Wrap text in a back-tick fence long enough to avoid collisions."""
+    ticks = max((len(m.group(0)) for m in re.finditer(r'`+', text)), default=0) + 1
+    fence = '`' * max(3, ticks)
+    return f"{fence}\n{text}\n{fence}"
+
+
+def escape_xml_tags(text: str, filepath: str, base_tag: str = "file-attachment") -> tuple[str, str]:
+    """Wrap text in XML-like tags, avoiding collisions with closing tags in content.
+
     Args:
-        text (str): The input text to escape.
-    
-    Returns:
-        str: The input text surrounded by an appropriate number of backticks.
-    """
-    backtick_pattern = r'(`+)'
-    max_len = max((len(m.group(1)) for m in re.finditer(backtick_pattern, text)), default=0)
-    surrounding_backticks = '`' * max(3, max_len + 1)
-    return f"{surrounding_backticks}\n{text}\n{surrounding_backticks}"
+        text: The content to wrap
+        filepath: Path to the file (for the original attribute)
+        base_tag: Base tag name (default: "file-attachment")
 
-def convert_docx_to_markdown(docx_path):
-    """
-    Convert a DOCX file to Markdown using pypandoc with GitHub Flavored Markdown (GFM) format.
-    
-    Args:
-        docx_path (str): Path to the DOCX file.
-    
     Returns:
-        str: Converted Markdown text, or an error message if conversion fails.
+        Tuple of (wrapped_content, tag_used)
     """
+    # Find a tag name that doesn't conflict with content
+    tag_name = base_tag
+    counter = 0
+
+    while f"</{tag_name}>" in text:
+        counter += 1
+        tag_name = f"{base_tag}-{counter}"
+
+    # Create the wrapped content with relative path attribute
+    rel_path = os.path.relpath(filepath)
+    opening_tag = f'<{tag_name} original="{rel_path}">'
+    closing_tag = f'</{tag_name}>'
+
+    wrapped_content = f"{opening_tag}\n{text}\n{closing_tag}"
+    return wrapped_content, tag_name
+
+
+# --------------------------------------------------------------------------- #
+#  File-type converters
+# --------------------------------------------------------------------------- #
+
+
+def extract_text_from_pdf(path: str) -> str:
+    """Extract text from PDF, OCR-fallback when necessary."""
+    txt = extract_text(path)
+    if txt.strip():
+        return txt
+    images = convert_from_path(path)
+    return ''.join(pytesseract.image_to_string(img) for img in images)
+
+
+def convert_docx_to_markdown(path: str) -> str:
+    """DOCX → GitHub-flavoured Markdown via pandoc."""
     try:
-        markdown_text = pypandoc.convert_file(
-            docx_path,
-            'gfm',  # GitHub Flavored Markdown
-            format='docx',
-            extra_args=[
-                '--wrap=none',  # Don't wrap lines
-                '--standalone',  # Include header/footer if present
-                '--markdown-headings=atx'  # Use # style headers
-            ]
+        return pypandoc.convert_file(
+            path, "gfm", format="docx",
+            extra_args=["--wrap=none", "--standalone", "--markdown-headings=atx"]
         )
-        return markdown_text
-    except (pypandoc.PandocError, OSError) as e:
-        return f"Failed to convert DOCX to Markdown: {str(e)}"
+    except (RuntimeError, OSError) as e:
+        return f"Failed to convert DOCX: {e}"
 
-def convert_xlsx_to_markdown(xlsx_path):
-    """
-    Convert an XLSX file into GitHub-flavored Markdown tables, one for each sheet.
 
-    Args:
-        xlsx_path (str): Path to the XLSX file.
-
-    Returns:
-        str: A string containing one or more GitHub-flavored Markdown tables
-             (plus headings for each sheet) for the entire workbook.
-    """
+def convert_pptx_to_text(path: str) -> str:
+    """Extract visible text from PPTX slides (requires python-pptx)."""
+    if Presentation is None:
+        return ("Failed to read PPTX: python-pptx not installed "
+                "(pip install python-pptx)")
     try:
-        # Read all sheets into a dictionary: {sheet_name: DataFrame}
-        xls = pd.read_excel(xlsx_path, sheet_name=None)
+        prs = Presentation(path)
     except Exception as e:
-        return f"Failed to read XLSX file: {str(e)}"
+        return f"Failed to open PPTX: {e}"
 
-    # Build a markdown representation of all sheets
-    markdown_parts = []
-    for sheet_name, df in xls.items():
-        # Convert DataFrame to a GitHub-flavored Markdown table
-        md_table = df.to_markdown(index=False, tablefmt="github")
-        markdown_parts.append(f"### Sheet: {sheet_name}\n\n{md_table}")
+    slides = []
+    for idx, slide in enumerate(prs.slides, start=1):
+        lines = [f"# Slide {idx}"]
+        for shape in slide.shapes:
+            if getattr(shape, "text", "").strip():
+                lines.append(shape.text.strip())
+        if len(lines) == 1:
+            lines.append("(No text on this slide)")
+        slides.append("\n".join(lines))
+    return "\n\n".join(slides)
 
-    return "\n\n".join(markdown_parts)
 
-def extract_text_from_pdf(pdf_path):
-    """
-    Extract text from a PDF file, using OCR if text extraction fails.
-    
-    Args:
-        pdf_path (str): Path to the PDF file.
-    
-    Returns:
-        str: Extracted text from the PDF.
-    """
-    text = extract_text(pdf_path)
-    if text.strip() == '':
-        # If no text was extracted, try OCR
-        images = convert_from_path(pdf_path)
-        text = ''.join([pytesseract.image_to_string(image) for image in images])
-    return text
+def convert_xlsx_to_markdown(path: str) -> str:
+    """Each sheet → GitHub-flavoured Markdown table."""
+    try:
+        sheets = pd.read_excel(path, sheet_name=None)
+    except Exception as e:
+        return f"Failed to read XLSX: {e}"
 
-def process_files(filenames, name_regex=None):
-    """
-    Process multiple files and return their contents as a Markdown formatted string.
-    
-    Args:
-        filenames (list): A list of filenames to process.
-        name_regex (str): Regular expression to filter filenames.
-    
-    Returns:
-        str: A Markdown formatted string containing the contents of all processed files.
-    """
-    markdown_output = []
-    for filename in filenames:
-        if name_regex and not re.search(name_regex, filename):
+    parts = []
+    for name, df in sheets.items():
+        parts.append(f"### Sheet: {name}\n\n{df.to_markdown(index=False, tablefmt='github')}")
+    return "\n\n".join(parts)
+
+
+def convert_tsv_to_markdown(path: str) -> str:
+    """Convert TSV file to GitHub-flavoured Markdown table."""
+    try:
+        df = pd.read_csv(path, sep='\t')
+        return df.to_markdown(index=False, tablefmt='github')
+    except Exception as e:
+        return f"Failed to read TSV: {e}"
+
+
+# --------------------------------------------------------------------------- #
+#  Core processing
+# --------------------------------------------------------------------------- #
+
+
+def process_files(filepaths, name_regex=None, use_xml_tags=False):
+    """Read, convert and wrap each file; return big Markdown string."""
+    out, failures = [], []
+
+    for path in filepaths:
+        if name_regex and not re.search(name_regex, path):
             continue
-        
+
+        print(f"[files2md] ⌛ processing: {path}", file=sys.stderr)
+        lower = path.lower()
+
         try:
-            # Distinguish file type by extension
-            if filename.lower().endswith('.pdf'):
-                contents = extract_text_from_pdf(filename)
-                escaped = escape_backticks(contents)
-                markdown_output.append(f"<!-- file-attachment: {filename} -->")
-                markdown_output.append(f"## Attached file: {filename}")
-                markdown_output.append(escaped)
+            if lower.endswith(".pdf"):
+                raw_content = extract_text_from_pdf(path)
 
-            elif filename.lower().endswith('.docx'):
-                contents = convert_docx_to_markdown(filename)
-                escaped = escape_backticks(contents)
-                markdown_output.append(f"<!-- file-attachment: {filename} -->")
-                markdown_output.append(f"## Attached file: {filename}")
-                markdown_output.append(escaped)
+            elif lower.endswith(".docx"):
+                raw_content = convert_docx_to_markdown(path)
 
-            elif filename.lower().endswith('.xlsx'):
-                contents = convert_xlsx_to_markdown(filename)
-                # For tables to render properly, do not wrap them in code fences:
-                markdown_output.append(f"<!-- file-attachment: {filename} -->")
-                markdown_output.append(f"## Attached file: {filename}")
-                markdown_output.append(contents)
+            elif lower.endswith(".pptx"):
+                raw_content = convert_pptx_to_text(path)
 
+            elif lower.endswith(".xlsx"):
+                raw_content = convert_xlsx_to_markdown(path)
+
+            elif lower.endswith(".tsv"):
+                raw_content = convert_tsv_to_markdown(path)
+
+            else:  # plain text or unknown
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        raw_content = fh.read()
+                except UnicodeDecodeError as e:
+                    print(f"[files2md] ⚠️  UTF-8 failed for {path}: {e}", file=sys.stderr)
+                    try:
+                        with open(path, encoding="latin-1") as fh:
+                            raw_content = fh.read()
+                    except Exception as e2:
+                        print(f"[files2md] 🚫 could not decode {path}: {e2}", file=sys.stderr)
+                        failures.append(path)
+                        continue
+
+            # Apply appropriate escaping based on mode
+            if use_xml_tags:
+                content = raw_content
             else:
-                # Plain text or unknown extension
-                with open(filename, 'r', encoding='utf-8') as file:
-                    contents = file.read()
-                escaped = escape_backticks(contents)
-                markdown_output.append(f"<!-- file-attachment: {filename} -->")
-                markdown_output.append(f"## Attached file: {filename}")
-                markdown_output.append(escaped)
+                # For non-markdown files, apply backtick escaping
+                if lower.endswith((".xlsx", ".tsv")):
+                    content = raw_content  # These are already markdown tables
+                else:
+                    content = escape_backticks(raw_content)
 
-        except IOError as e:
-            print(f"Error: Could not read file {filename}. Skipping.", file=sys.stderr)
-            print(e, file=sys.stderr)
-    
-    return '\n\n'.join(markdown_output)
+            end_comment = f"<!-- end of: {os.path.basename(path)} -->"
+            if use_xml_tags:
+                wrapped_content, tag_used = escape_xml_tags(content, path)
+                out.extend([f"## Attached file: {path}", wrapped_content, end_comment])
+            else:
+                out.extend([f"<!-- file-attachment: {path} -->",
+                            f"## Attached file: {path}", content, end_comment])
 
-def find_files(paths, recursive=False, name_regex=None):
-    """
-    Find files in the given paths, optionally recursing into subdirectories.
-    
-    Args:
-        paths (list): List of file and directory paths to search.
-        recursive (bool): Whether to search subdirectories recursively.
-        name_regex (str): Regular expression to filter filenames.
-    
-    Returns:
-        list: List of file paths matching the criteria.
-    """
-    found_files = []
+        except Exception as e:
+            print(f"[files2md] 🚫 unexpected error on {path}: {e}", file=sys.stderr)
+            failures.append(path)
+
+    if failures:
+        print("\n[files2md] SUMMARY — failed files:", file=sys.stderr)
+        for f in failures:
+            print(f"  • {f}", file=sys.stderr)
+
+    return "\n\n".join(out)
+
+
+# --------------------------------------------------------------------------- #
+#  File discovery
+# --------------------------------------------------------------------------- #
+
+
+def is_hidden(path: str) -> bool:
+    """True if the basename starts with a dot."""
+    return os.path.basename(path).startswith(".")
+
+
+def find_files(paths, *, recursive=False, include_hidden=False, name_regex=None):
+    """Resolve all input paths to a flat list of filepaths."""
+    results = []
+
     for path in paths:
+        if not include_hidden and is_hidden(path):
+            continue
+
         if os.path.isfile(path):
-            found_files.append(path)
+            results.append(path)
+
         elif os.path.isdir(path):
             if recursive:
-                for root, _, files in os.walk(path):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        if name_regex is None or re.search(name_regex, file_path):
-                            found_files.append(file_path)
+                for root, dirs, files in os.walk(path):
+                    if not include_hidden:
+                        # prune hidden directories in-place
+                        dirs[:] = [d for d in dirs if not d.startswith(".")]
+                        files = [f for f in files if not f.startswith(".")]
+                    for fname in files:
+                        fpath = os.path.join(root, fname)
+                        if include_hidden or not is_hidden(fpath):
+                            if name_regex is None or re.search(name_regex, fpath):
+                                results.append(fpath)
             else:
-                for item in os.listdir(path):
-                    item_path = os.path.join(path, item)
-                    if os.path.isfile(item_path) and (name_regex is None or re.search(name_regex, item_path)):
-                        found_files.append(item_path)
-    return found_files
+                for fname in os.listdir(path):
+                    if not include_hidden and fname.startswith("."):
+                        continue
+                    fpath = os.path.join(path, fname)
+                    if os.path.isfile(fpath) and (
+                        name_regex is None or re.search(name_regex, fpath)
+                    ):
+                        results.append(fpath)
+
+    return results
+
+
+# --------------------------------------------------------------------------- #
+#  CLI entry-point
+# --------------------------------------------------------------------------- #
+
 
 def main():
-    """
-    Main function to parse command-line arguments and process files.
-    """
-    # Verify that pandoc is available (for DOCX -> MD conversion)
     try:
         pypandoc.get_pandoc_version()
     except OSError:
-        print("Error: pandoc is not installed. Please install pandoc first.", file=sys.stderr)
-        sys.exit(1)
+        print("Warning: pandoc not found – DOCX conversion disabled.", file=sys.stderr)
 
-    parser = argparse.ArgumentParser(
-        description="Combine files into a single markdown document, with recursive directory searching and filename pattern matching."
+    ap = argparse.ArgumentParser(
+        description="Combine files into a single Markdown document."
     )
-    parser.add_argument("paths", metavar="PATH", type=str, nargs='+',
-                        help="List of files or directories to process.")
-    parser.add_argument("-r", "--recursive", action="store_true",
-                        help="Recursively search directories for files.")
-    parser.add_argument("--name-regex", type=str,
-                        help="Regular expression to match filenames.")
-    parser.add_argument("--name-code", action="store_true",
-                        help="Use a predefined regex to match common code file extensions.")
-    parser.add_argument("--name-docs", action="store_true",
-                        help="Use a predefined regex to match common document file extensions.")
-    args = parser.parse_args()
-    
-    # Validate that only one naming argument is used
-    if sum([bool(args.name_regex), args.name_code, args.name_docs]) > 1:
-        print("Error: Can only use one of --name-regex, --name-code, or --name-docs at a time.", file=sys.stderr)
-        sys.exit(1)
-    
-    # Select the appropriate filename pattern
-    name_regex = None
-    if args.name_regex:
-        name_regex = args.name_regex
-    elif args.name_code:
-        name_regex = CODE_FILE_PATTERN
-    elif args.name_docs:
-        name_regex = DOCS_FILE_PATTERN
-    
-    # Gather and process files
-    files = find_files(args.paths, recursive=args.recursive, name_regex=name_regex)
-    markdown_content = process_files(files, name_regex=name_regex)
-    
-    # Print final combined markdown
-    print(markdown_content)
+    ap.add_argument("paths", nargs="+", help="Files or directories to process.")
+    ap.add_argument(
+        "-r", "--recursive", action="store_true",
+        help="Recursively search directories."
+    )
+    hidden = ap.add_mutually_exclusive_group()
+    hidden.add_argument(
+        "--include-hidden-files", action="store_true", dest="include_hidden",
+        help="Include dotfiles (hidden files)."
+    )
+    hidden.add_argument(
+        "--exclude-hidden-files", action="store_false", dest="include_hidden",
+        help="(Default) Skip dotfiles.", default=False
+    )
+    ap.add_argument("--name-regex", help="Regex to filter filenames.")
+    ap.add_argument("--name-code", action="store_true",
+                    help="Use preset regex for common code files.")
+    ap.add_argument("--name-docs", action="store_true",
+                    help="Use preset regex for common document files.")
+    ap.add_argument("--xml-tags", action="store_true",
+                    help="Use XML-like tags instead of backtick fences "
+                         "(defaults to <file-attachment>).")
+    args = ap.parse_args()
+
+    if sum(map(bool, (args.name_regex, args.name_code, args.name_docs))) > 1:
+        ap.error("Choose only one of --name-regex / --name-code / --name-docs.")
+
+    regex = (
+        args.name_regex if args.name_regex else
+        CODE_FILE_PATTERN if args.name_code else
+        DOCS_FILE_PATTERN if args.name_docs else
+        None
+    )
+
+    files = find_files(
+        args.paths,
+        recursive=args.recursive,
+        include_hidden=args.include_hidden,
+        name_regex=regex,
+    )
+    print(process_files(files, name_regex=regex, use_xml_tags=args.xml_tags))
+
 
 if __name__ == "__main__":
     main()
